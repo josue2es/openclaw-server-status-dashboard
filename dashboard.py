@@ -27,8 +27,8 @@ sessions = {}  # token -> expiry timestamp
 
 last_speedtest_time = 0
 cached_speedtest_result = "Not run yet."
-last_apitest_time = 0
-APITEST_COOLDOWN = 30  # seconds between API tests
+apitest_times = {}  # (provider, model) -> last test timestamp
+APITEST_COOLDOWN = 30  # seconds between tests per model
 
 def check_session(cookie_header):
     if not cookie_header:
@@ -787,7 +787,7 @@ HTML = """
         initChart();
         fetch('/api/history').then(r => r.json()).then(h => {
             fullHistory = {
-                labels: h.labels,
+                labels: h.labels.map(l => l.includes(' ') ? l.split(' ')[1] : l),
                 cpu: h.cpu,
                 ram: h.ram,
                 rx: h.rx,
@@ -1062,25 +1062,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
 
         if self.path == '/api/test':
-            global last_apitest_time
             now = time.time()
-            wait = APITEST_COOLDOWN - (now - last_apitest_time)
-            if wait > 0:
-                resp = {"status": "rate_limited", "message": f"Please wait {int(wait)+1}s before testing again."}
-            else:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length)
-                try:
-                    req = json.loads(body)
-                    provider = req.get('provider', '')
-                    model = req.get('model', '')
-                    if not provider or not model:
-                        resp = {"status": "error", "message": "Missing provider or model"}
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            try:
+                req = json.loads(body)
+                provider = req.get('provider', '')
+                model = req.get('model', '')
+                if not provider or not model:
+                    resp = {"status": "error", "message": "Missing provider or model"}
+                else:
+                    key = (provider, model)
+                    wait = APITEST_COOLDOWN - (now - apitest_times.get(key, 0))
+                    if wait > 0:
+                        resp = {"status": "rate_limited", "message": f"Please wait {int(wait)+1}s before testing {model} again."}
                     else:
-                        last_apitest_time = now
+                        apitest_times[key] = now
                         resp = test_api(provider, model)
-                except Exception as e:
-                    resp = {"status": "error", "message": str(e)}
+            except Exception as e:
+                resp = {"status": "error", "message": str(e)}
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
