@@ -9,16 +9,49 @@ import sqlite3
 import threading
 import urllib.request
 import urllib.error
+import hashlib
+import hmac
+import secrets
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
+HOME = os.path.expanduser('~')
 PORT = 8080
-DB_PATH = '/home/josue2es/.openclaw/workspace/dashboard.db'
-AUTH_PROFILES_PATH = '/home/josue2es/.openclaw/agents/main/agent/auth-profiles.json'
+DB_PATH = os.path.join(HOME, '.openclaw/workspace/dashboard.db')
+AUTH_PROFILES_PATH = os.path.join(HOME, '.openclaw/agents/main/agent/auth-profiles.json')
+
+# Password hash (sha256 of the actual password)
+PASSWORD_HASH = 'd8e87dbe011188ad0968f1f57e259bd9a8465f353f5032485e8d482e46574dcc'
+SESSION_EXPIRY = 86400  # 24 hours
+sessions = {}  # token -> expiry timestamp
+
 last_speedtest_time = 0
 cached_speedtest_result = "Not run yet."
 last_apitest_time = 0
 APITEST_COOLDOWN = 30  # seconds between API tests
+
+def check_session(cookie_header):
+    if not cookie_header:
+        return False
+    for part in cookie_header.split(';'):
+        part = part.strip()
+        if part.startswith('session='):
+            token = part[len('session='):]
+            expiry = sessions.get(token)
+            if expiry and time.time() < expiry:
+                return True
+    return False
+
+def create_session():
+    token = secrets.token_hex(32)
+    sessions[token] = time.time() + SESSION_EXPIRY
+    return token
+
+def purge_expired_sessions():
+    now = time.time()
+    expired = [t for t, exp in sessions.items() if now >= exp]
+    for t in expired:
+        del sessions[t]
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -282,7 +315,7 @@ def test_api(provider, model):
 def get_cron_jobs():
     jobs = []
     try:
-        with open('/home/josue2es/.openclaw/cron/jobs.json', 'r') as f:
+        with open(os.path.join(HOME, '.openclaw/cron/jobs.json'), 'r') as f:
             data = json.load(f)
             tz = ZoneInfo("America/El_Salvador")
             for job in data.get('jobs', []):
@@ -299,7 +332,8 @@ def get_cron_jobs():
 
 def get_memories():
     try:
-        with open('/home/josue2es/.openclaw/workspace/memory/2026-04-02.md', 'r') as f:
+        today = datetime.now().strftime('%Y-%m-%d')
+        with open(os.path.join(HOME, f'.openclaw/workspace/memory/{today}.md'), 'r') as f:
             lines = [l.strip() for l in f.readlines() if l.strip().startswith('-')]
             return lines[-5:]
     except:
@@ -308,7 +342,7 @@ def get_memories():
 def get_issues():
     issues = {'active': [], 'fixed': []}
     try:
-        with open('/home/josue2es/.openclaw/workspace/ISSUES.md', 'r') as f:
+        with open(os.path.join(HOME, '.openclaw/workspace/ISSUES.md'), 'r') as f:
             lines = f.readlines()
             section = None
             for line in lines:
@@ -320,6 +354,34 @@ def get_issues():
     except:
         pass
     return issues
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Foxy Dashboard - Login</title>
+<style>
+    body { font-family: monospace; background-color: #1e1e1e; color: #00ff00; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+    .box { background-color: #2d2d2d; border: 1px solid #444; padding: 40px; border-radius: 5px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); min-width: 320px; }
+    h2 { color: #ff9900; margin-top: 0; text-align: center; }
+    input[type=password] { width: 100%; box-sizing: border-box; background: #1e1e1e; color: #00ff00; border: 1px solid #444; padding: 10px; font-family: monospace; font-size: 1em; margin: 10px 0 20px 0; border-radius: 3px; }
+    input[type=password]:focus { outline: none; border-color: #ff9900; }
+    button { width: 100%; background-color: #ff9900; color: #1e1e1e; border: none; padding: 12px; font-weight: bold; cursor: pointer; border-radius: 3px; font-size: 1em; font-family: monospace; }
+    button:hover { background-color: #ffaa33; }
+    .error { color: #ff5555; text-align: center; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="box">
+    <h2>Foxy Server Monitor</h2>
+    <form method="POST" action="/login">
+        <input type="password" name="password" placeholder="Password" autofocus />
+        <button type="submit">Login</button>
+    </form>
+    {error}
+</div>
+</body>
+</html>"""
 
 HTML = """
 <!DOCTYPE html>
@@ -855,9 +917,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress access logs
 
+    def redirect_to_login(self):
+        self.send_response(302)
+        self.send_header('Location', '/login')
+        self.end_headers()
+
     def do_GET(self):
         global last_speedtest_time, cached_speedtest_result
-        
+
+        if self.path == '/login':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(LOGIN_HTML.replace('{error}', '').encode('utf-8'))
+            return
+
+        if not check_session(self.headers.get('Cookie')):
+            self.redirect_to_login()
+            return
+
         if self.path == '/':
             self.send_response(200)
             self.send_header("Content-type", "text/html; charset=utf-8")
@@ -953,6 +1031,36 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if self.path == '/login':
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length).decode()
+            password = ''
+            for part in body.split('&'):
+                if part.startswith('password='):
+                    password = part[len('password='):].replace('+', ' ')
+                    from urllib.parse import unquote
+                    password = unquote(password)
+            submitted_hash = hashlib.sha256(password.encode()).hexdigest()
+            if hmac.compare_digest(submitted_hash, PASSWORD_HASH):
+                purge_expired_sessions()
+                token = create_session()
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.send_header('Set-Cookie', f'session={token}; HttpOnly; SameSite=Strict; Max-Age={SESSION_EXPIRY}')
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.end_headers()
+                error = '<p class="error">Invalid password.</p>'
+                self.wfile.write(LOGIN_HTML.replace('{error}', error).encode('utf-8'))
+            return
+
+        if not check_session(self.headers.get('Cookie')):
+            self.send_response(401)
+            self.end_headers()
+            return
+
         if self.path == '/api/test':
             global last_apitest_time
             now = time.time()
